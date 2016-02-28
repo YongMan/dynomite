@@ -183,7 +183,6 @@ _conn_get(void)
     conn->same_dc = 1;
     conn->avail_tokens = msgs_per_sec();
     conn->last_sent = 0;
-    conn->last_received = 0;
     conn->attempted_reconnect = 0;
     conn->non_bytes_recv = 0;
     //conn->non_bytes_send = 0;
@@ -191,8 +190,8 @@ _conn_get(void)
     conn_set_write_consistency(conn, g_write_consistency);
     conn->type = CONN_UNSPECIFIED;
 
-    unsigned char *ase_key = generate_aes_key();
-    strncpy(conn->aes_key, ase_key, strlen(ase_key)); //generate a new key for each connection
+    unsigned char *aes_key = generate_aes_key();
+    strncpy((char *)conn->aes_key, (char *)aes_key, strlen((char *)aes_key)); //generate a new key for each connection
 
     return conn;
 }

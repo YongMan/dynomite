@@ -344,7 +344,7 @@ mbuf_write_char(struct mbuf *mbuf, char ch)
 
 
 void 
-mbuf_write_string(struct mbuf *mbuf, struct string *s)
+mbuf_write_string(struct mbuf *mbuf, const struct string *s)
 {
    ASSERT(s->len < mbuf_size(mbuf));
    mbuf_copy(mbuf, s->data, s->len);
@@ -355,7 +355,7 @@ void mbuf_write_mbuf(struct mbuf *mbuf, struct mbuf *data)
     mbuf_copy(mbuf, data->pos, data->last - data->pos);
 }
 
-void mbuf_write_bytes(struct mbuf *mbuf, char *data, int len)
+void mbuf_write_bytes(struct mbuf *mbuf, unsigned char *data, int len)
 {
     mbuf_copy(mbuf, data, len);
 }

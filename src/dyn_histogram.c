@@ -110,7 +110,7 @@ uint64_t* histo_bucket_offsets()
 }
 
 
-void histo_add(struct histogram *histo, uint64_t val)
+void histo_add(volatile struct histogram *histo, uint64_t val)
 {
 	if (histo == NULL) {
 		return;

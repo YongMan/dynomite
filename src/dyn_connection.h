@@ -133,7 +133,6 @@ struct conn {
     unsigned           same_dc:1;            /* bit to indicate whether a peer conn is same DC */
     uint32_t           avail_tokens;          /* used to throttle the traffics */
     uint32_t           last_sent;             /* ts in sec used to determine the last sent time */
-    uint32_t           last_received;         /* last ts to receive a byte */
     uint32_t           attempted_reconnect;   /* #attempted reconnect before calling close */
     uint32_t           non_bytes_recv;        /* #times or epoll triggers we receive no bytes */
     //uint32_t           non_bytes_send;        /* #times or epoll triggers that we are not able to send any bytes */
