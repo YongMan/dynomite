@@ -97,19 +97,6 @@ static uint64_t count(struct histogram *histo)
 	return sum;
 }
 
-
-int histo_bucket_size()
-{
-	return BUCKET_SIZE;
-}
-
-
-uint64_t* histo_bucket_offsets()
-{
-	return bucket_offsets;
-}
-
-
 void histo_add(volatile struct histogram *histo, uint64_t val)
 {
 	if (histo == NULL) {
@@ -300,25 +287,4 @@ void histo_compute(struct histogram *histo)
 	histo->val_95th = val_95th;
 	histo->val_99th = val_99th;
 	histo->val_999th = val_999th;
-}
-
-
-void print_buckets(struct histogram *histo) {
-	uint64_t *buckets = histo->buckets;
-	int i;
-	for(i = 0; i<BUCKET_SIZE; i++) {
-		loga(" val: %lu -  offset: %lu\n", buckets[i], bucket_offsets[i]);
-	}
-
-	printf("\n");
-}
-
-void print_bucketoffsets() {
-	int i;
-	for(i = 0; i<BUCKET_SIZE; i++) {
-		loga(" val %lu\n", bucket_offsets[i]);
-	}
-
-	loga("\n");
-
 }
