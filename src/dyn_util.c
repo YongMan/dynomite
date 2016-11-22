@@ -80,6 +80,12 @@ dn_set_reuseaddr(int sd)
     return setsockopt(sd, SOL_SOCKET, SO_REUSEADDR, &reuse, len);
 }
 
+int
+dn_set_keepalive(int sd, int val)
+{
+    return setsockopt(sd, SOL_SOCKET, SO_KEEPALIVE, &val, sizeof(val));
+}
+
 /*
  * Disable Nagle algorithm on TCP socket.
  *
@@ -446,20 +452,20 @@ _dn_recvn(int sd, void *vptr, size_t n)
 /*
  * Return the current time in microseconds since Epoch
  */
-int64_t
+usec_t
 dn_usec_now(void)
 {
     struct timeval now;
-    int64_t usec;
+    uint64_t usec;
     int status;
 
     status = gettimeofday(&now, NULL);
     if (status < 0) {
         log_error("gettimeofday failed: %s", strerror(errno));
-        return -1;
+        return 0;
     }
 
-    usec = (int64_t)now.tv_sec * 1000000LL + (int64_t)now.tv_usec;
+    usec = (uint64_t)now.tv_sec * 1000000ULL + (uint64_t)now.tv_usec;
 
     return usec;
 }
@@ -467,10 +473,10 @@ dn_usec_now(void)
 /*
  * Return the current time in milliseconds since Epoch
  */
-int64_t
+msec_t
 dn_msec_now(void)
 {
-    return dn_usec_now() / 1000LL;
+    return dn_usec_now() / 1000ULL;
 }
 
 static int

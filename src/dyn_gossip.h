@@ -17,11 +17,11 @@
 #define SEED_BUF_SIZE (1024*1024)     //in bytes
 
 
-typedef uint8_t (*seeds_provider_t)(struct context *, struct string *);
+typedef uint8_t (*seeds_provider_t)(struct context *, struct mbuf *);
 extern struct gossip_node_pool gn_pool;
 
 
-struct node {
+struct gossip_node {
     struct dyn_token   token;            /* token for this node */
     struct string      dc;
     struct string      rack;
@@ -31,8 +31,8 @@ struct node {
 
     int                port;             /* port */
 
-    int64_t            next_retry;       /* next retry time in usec */
-    int64_t            last_retry;       /* last retry time in usec */
+    msec_t             next_retry;       /* next retry time in msec */
+    msec_t             last_retry;       /* last retry time in msec */
     uint32_t           failure_count;    /* # consecutive failures */
 
     bool               is_seed;          /* seed? */

@@ -27,8 +27,7 @@ dnode_req_forward_error(struct context *ctx, struct conn *conn, struct msg *msg)
     msg->error = 1;
     msg->err = errno;
 
-    /* noreply request don't expect any response */
-    if (msg->noreply || msg->swallow) {
+    if (!msg->expect_datastore_reply || msg->swallow) {
         req_put(msg);
         return;
     }
@@ -43,14 +42,11 @@ dnode_req_forward_error(struct context *ctx, struct conn *conn, struct msg *msg)
 }
 
 static void
-dnode_peer_req_forward_stats(struct context *ctx, struct server *server, struct msg *msg)
+dnode_peer_req_forward_stats(struct context *ctx, struct node *server, struct msg *msg)
 {
     ASSERT(msg->request);
-    //use only the 1st pool
-    //struct server_pool *pool = (struct server_pool *) array_get(&ctx->pool, 0);
-    struct server_pool *pool = server->owner;
-    stats_pool_incr(ctx, pool, peer_requests);
-    stats_pool_incr_by(ctx, pool, peer_request_bytes, msg->mlen);
+    stats_pool_incr(ctx, peer_requests);
+    stats_pool_incr_by(ctx, peer_request_bytes, msg->mlen);
 }
 
 
@@ -61,7 +57,7 @@ dnode_peer_req_forward(struct context *ctx, struct conn *c_conn,
                        struct rack *rack, uint8_t *key, uint32_t keylen)
 {
 
-    struct server *server = p_conn->owner;
+    struct node *server = p_conn->owner;
     log_debug(LOG_DEBUG, "forwarding request from client conn '%s' to peer conn '%s' on rack '%.*s' dc '%.*s' ",
               dn_unresolve_peer_desc(c_conn->sd), dn_unresolve_peer_desc(p_conn->sd),
               rack->name->len, rack->name->data,
@@ -69,10 +65,6 @@ dnode_peer_req_forward(struct context *ctx, struct conn *c_conn,
 
     struct string *dc = rack->dc;
     rstatus_t status;
-    /* enqueue message (request) into client outq, if response is expected */
-    if (!msg->noreply && !msg->swallow) {
-        conn_enqueue_outq(ctx, c_conn, msg);
-    }
 
     ASSERT(p_conn->type == CONN_DNODE_PEER_SERVER);
     ASSERT((c_conn->type == CONN_CLIENT) ||
@@ -96,6 +88,10 @@ dnode_peer_req_forward(struct context *ctx, struct conn *c_conn,
     struct server_pool *pool = c_conn->owner;
     dmsg_type_t msg_type = (string_compare(&pool->dc, dc) != 0)? DMSG_REQ_FORWARD : DMSG_REQ;
 
+    // SMB: THere is some non trivial business happening here. Better refer to the
+    // comment in dnode_rsp_send_next to understand the stuff here.
+    // Note: THere MIGHT BE A NEED TO PORT THE dnode_header_prepended FIX FROM THERE
+    // TO HERE. especially when a message is being sent in parts
     if (p_conn->dnode_secured) {
         //Encrypting and adding header for a request
         if (log_loggable(LOG_VVERB)) {
@@ -196,10 +192,10 @@ peer_gossip_forward1(struct context *ctx, struct conn *conn, bool redis, struct 
  * Sending a mbuf of gossip data over the wire to a peer
  */
 void
-dnode_peer_gossip_forward(struct context *ctx, struct conn *conn, int data_store, struct mbuf *data_buf)
+dnode_peer_gossip_forward(struct context *ctx, struct conn *conn, struct mbuf *data_buf)
 {
     rstatus_t status;
-    struct msg *msg = msg_get(conn, 1, data_store, __FUNCTION__);
+    struct msg *msg = msg_get(conn, 1, __FUNCTION__);
 
     if (msg == NULL) {
         log_debug(LOG_DEBUG, "Unable to obtain a msg");
@@ -228,7 +224,7 @@ dnode_peer_gossip_forward(struct context *ctx, struct conn *conn, int data_store
                 return; //TODOs: need to clean up
             }
 
-            status = dyn_aes_encrypt(data_buf->pos, mbuf_length(data_buf), encrypted_buf, conn->aes_key);
+            status = dyn_aes_encrypt(data_buf->pos, (int)mbuf_length(data_buf), encrypted_buf, conn->aes_key);
             if (log_loggable(LOG_VERB)) {
                log_debug(LOG_VERB, "#encrypted bytes : %d", status);
             }
@@ -282,6 +278,6 @@ dnode_peer_gossip_forward(struct context *ctx, struct conn *conn, int data_store
     //need to handle a reply
     //conn->enqueue_outq(ctx, conn, msg);
 
-    msg->noreply = 1;
+    msg->expect_datastore_reply = 0;
     conn_enqueue_inq(ctx, conn, msg);
 }

@@ -31,7 +31,7 @@ rsp_get(struct conn *conn)
     ASSERT((conn->type == CONN_DNODE_PEER_SERVER) ||
            (conn->type == CONN_SERVER));
 
-    msg = msg_get(conn, false, conn->data_store, __FUNCTION__);
+    msg = msg_get(conn, false, __FUNCTION__);
     if (msg == NULL) {
         conn->err = errno;
     }
@@ -102,7 +102,7 @@ rsp_send_next(struct context *ctx, struct conn *conn)
                (conn->type = CONN_CLIENT), "conn %s", conn_get_type_string(conn));
 
     req = TAILQ_FIRST(&conn->omsg_q);
-    if (req == NULL || !req->selected_rsp) {
+    if (req == NULL || (!req->selected_rsp && !req_done(conn, req))) {
         /* nothing is outstanding, initiate close? */
         if (req == NULL && conn->eof) {
             conn->done = 1;
@@ -138,11 +138,11 @@ rsp_send_next(struct context *ctx, struct conn *conn)
         }
         rsp->peer = req;
         req->selected_rsp = rsp;
-        log_error("creating new error rsp %p", rsp);
+        log_debug(LOG_VERB, "creating new error rsp %p", rsp);
         if (conn->dyn_mode) {
-      	  stats_pool_incr(ctx, conn->owner, peer_forward_error);
+      	  stats_pool_incr(ctx, peer_forward_error);
         } else {
-      	  stats_pool_incr(ctx, conn->owner, forward_error);
+      	  stats_pool_incr(ctx, forward_error);
         }
     } else {
         rsp = req->selected_rsp;

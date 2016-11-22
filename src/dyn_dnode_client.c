@@ -6,6 +6,7 @@
 #include "dyn_core.h"
 #include "dyn_server.h"
 #include "dyn_dnode_client.h"
+#include "dyn_dict_msg_id.h"
 
 static void
 dnode_client_ref(struct conn *conn, void *owner)
@@ -29,6 +30,7 @@ dnode_client_ref(struct conn *conn, void *owner)
 
     /* owner of the client connection is the server pool */
     conn->owner = owner;
+    conn->outstanding_msgs_dict = dictCreate(&msg_table_dict_type, NULL);
     log_debug(LOG_VVERB, "dyn: ref conn %p owner %p into pool '%.*s'", conn, pool,
               pool->name.len, pool->name.data);
 }
@@ -43,6 +45,8 @@ dnode_client_unref(struct conn *conn)
 
     pool = conn->owner;
     conn->owner = NULL;
+    dictRelease(conn->outstanding_msgs_dict);
+    conn->outstanding_msgs_dict = NULL;
 
     ASSERT(pool->dn_conn_q != 0);
     pool->dn_conn_q--;
@@ -83,11 +87,11 @@ static void
 dnode_client_close_stats(struct context *ctx, struct server_pool *pool, err_t err,
                    unsigned eof)
 {
-    stats_pool_decr(ctx, pool, dnode_client_connections);
+    stats_pool_decr(ctx, dnode_client_connections);
 
     if (eof) {
         //fix this also
-        stats_pool_incr(ctx, pool, dnode_client_eof);
+        stats_pool_incr(ctx, dnode_client_eof);
         return;
     }
 
@@ -103,7 +107,7 @@ dnode_client_close_stats(struct context *ctx, struct server_pool *pool, err_t er
     case EHOSTUNREACH:
     default:
         //fix this also
-        stats_pool_incr(ctx, pool, dnode_client_err);
+        stats_pool_incr(ctx, dnode_client_err);
         break;
     }
 }
@@ -137,6 +141,7 @@ dnode_client_close(struct context *ctx, struct conn *conn)
                   msg->type);
         }
 
+        dictDelete(conn->outstanding_msgs_dict, &msg->id);
         req_put(msg);
     }
 
@@ -156,6 +161,7 @@ dnode_client_close(struct context *ctx, struct conn *conn)
                       msg->error ? "error": "completed", msg->id, msg->mlen,
                       msg->type);
             }
+            dictDelete(conn->outstanding_msgs_dict, &msg->id);
             req_put(msg);
         } else {
             msg->swallow = 1;
@@ -184,20 +190,37 @@ dnode_client_close(struct context *ctx, struct conn *conn)
 }
 
 static rstatus_t
-dnode_client_handle_response(struct conn *conn, msgid_t msgid, struct msg *rsp)
+dnode_client_handle_response(struct conn *conn, msgid_t reqid, struct msg *rsp)
 {
     // Forward the response to the caller which is client connection.
     rstatus_t status = DN_OK;
     struct context *ctx = conn_to_ctx(conn);
-    /* There is no hash table on the dnode client side. So we rely on rsp->peer
-       to get the corresponding request */
-    ASSERT_LOG(rsp->peer, "rsp %d:%d does not have a peer", rsp->id, rsp->parent_id);
-    struct msg *req = rsp->peer;
-    req->peer = NULL;
+
+    ASSERT(conn->type == CONN_DNODE_PEER_CLIENT);
+    // Fetch the original request
+    struct msg *req = dictFetchValue(conn->outstanding_msgs_dict, &reqid);
+    if (!req) {
+        log_notice("looks like we already cleanedup the request for %d", reqid);
+        rsp_put(rsp);
+        return DN_OK;
+    }
+
+    // dnode client has no extra logic of coalescing etc like the client/coordinator.
+    // Hence all work for this request is done at this time
+    ASSERT_LOG(!req->peer, "req %lu:%lu has peer set", req->id, req->parent_id);
     req->selected_rsp = rsp;
-    status = event_add_out(ctx->evb, conn);
-    if (status != DN_OK) {
-        conn->err = errno;
+    rsp->peer = req;
+
+    // Remove the message from the hash table. 
+    dictDelete(conn->outstanding_msgs_dict, &reqid);
+
+    // If this request is first in the out queue, then the connection is ready,
+    // add the connection to epoll for writing
+    if (conn_is_req_first_in_outqueue(conn, req)) {
+        status = event_add_out(ctx->evb, conn);
+        if (status != DN_OK) {
+            conn->err = errno;
+        }
     }
     return status;
 }
@@ -248,6 +271,9 @@ dnode_req_forward(struct context *ctx, struct conn *conn, struct msg *msg)
     key = NULL;
     keylen = 0;
 
+    log_debug(LOG_DEBUG, "conn %p adding message %d:%d", conn, msg->id, msg->parent_id);
+    dictAdd(conn->outstanding_msgs_dict, &msg->id, msg);
+
     if (!string_empty(&pool->hash_tag)) {
         struct string *tag = &pool->hash_tag;
         uint8_t *tag_start, *tag_end;
@@ -283,7 +309,7 @@ dnode_req_forward(struct context *ctx, struct conn *conn, struct msg *msg)
             if (string_compare(rack->name, &pool->rack) == 0 ) {
                 rack_msg = msg;
             } else {
-                rack_msg = msg_get(conn, msg->request, msg->data_store, __FUNCTION__);
+                rack_msg = msg_get(conn, msg->request, __FUNCTION__);
                 if (rack_msg == NULL) {
                     log_debug(LOG_VERB, "whelp, looks like yer screwed now, buddy. no inter-rack messages for you!");
                     continue;
@@ -346,9 +372,8 @@ dnode_req_client_enqueue_omsgq(struct context *ctx, struct conn *conn, struct ms
     //use only the 1st pool
     conn->omsg_count++;
     histo_add(&ctx->stats->dnode_client_out_queue, conn->omsg_count);
-    struct server_pool *pool = (struct server_pool *) array_get(&ctx->pool, 0);
-    stats_pool_incr(ctx, pool, dnode_client_out_queue);
-    stats_pool_incr_by(ctx, pool, dnode_client_out_queue_bytes, msg->mlen);
+    stats_pool_incr(ctx, dnode_client_out_queue);
+    stats_pool_incr_by(ctx, dnode_client_out_queue_bytes, msg->mlen);
 }
 
 static void
@@ -363,9 +388,8 @@ dnode_req_client_dequeue_omsgq(struct context *ctx, struct conn *conn, struct ms
     //use the 1st pool
     conn->omsg_count--;
     histo_add(&ctx->stats->dnode_client_out_queue, conn->omsg_count);
-    struct server_pool *pool = (struct server_pool *) array_get(&ctx->pool, 0);
-    stats_pool_decr(ctx, pool, dnode_client_out_queue);
-    stats_pool_decr_by(ctx, pool, dnode_client_out_queue_bytes, msg->mlen);
+    stats_pool_decr(ctx, dnode_client_out_queue);
+    stats_pool_decr_by(ctx, dnode_client_out_queue_bytes, msg->mlen);
 }
 
 /* dnode sends a response back to a peer  */
@@ -374,6 +398,52 @@ dnode_rsp_send_next(struct context *ctx, struct conn *conn)
 {
     rstatus_t status;
 
+    // SMB: There is some non trivial thing happening here. And I think it is very
+    // important to read this before anything is changed in here. There is also a
+    // bug that exists which I will mention briefly:
+    // A message is a structure that has a list of mbufs which hold the actual data.
+    // Each mbuf has start, pos, last as pointers (amongst others) which indicate start of the
+    // buffer, current read position and end of the buffer respectively.
+    //
+    // Every time a message is sent to a peer within dynomite, a DNODE header is
+    // prepended which is created using dmsg_write. A message remembers this case
+    // in dnode_header_prepended, so that if the messsage is sent in parts, the
+    // header is not prepended again for the subsequent parts.
+    //
+    // Like I said earlier there is a pos pointer in mbuf. If a message is sent
+    // partially (or it is parsed partially too I think) the pos reflects that
+    // case such that things can be resumed where it left off.
+    //
+    // dmsg_write has a parameter which reflects the payload length following the
+    // dnode header calculated by msg_length. msg_length is a summation of all
+    // mbuf sizes (last - start). Which I think is wrong.
+    //
+    // +------------+           +---------------+
+    // |    DC1N1   +---------> |     DC2N1     |
+    // +------------+           +-------+-------+
+    //                                  |
+    //                                  |
+    //                                  |
+    //                                  |
+    //                          +-------v-------+
+    //                          |    DC2N2      |
+    //                          +---------------+
+    //
+    // Consider the case where
+    // a node DC1N1 in region DC1 sends a request to DC2N1 which forwards it to
+    // to local token owner DC2N2. Now DC2N1 receives a response from DC2N2 which
+    // has to be relayed back to DC1N1. This response from DC2N2 already has a
+    // dnode header but for the link between DC2N1 and DC2N2. DC2N1 should strip
+    // this header and prepend its own header for sending it back to DC1N1. This
+    // gets handled in encryption case since we overwrite all mbufs in the response
+    // However if the encryption is off, the message length sent to dmsg_write
+    // consists of the header from DC2N2 also which is wrong. So this relaying
+    // of responses will not work for the case where encryption is disabled.
+    //
+    // So msg_length should really be from mbuf->pos and not mbuf->start. This
+    // is a problem only with remote region replication since that is the only
+    // case where we CAN have 2 hops to send the request/response. This is also
+    // not a problem if encryption is ON.
     ASSERT(conn->type == CONN_DNODE_PEER_CLIENT);
 
     struct msg *rsp = rsp_send_next(ctx, conn);
@@ -383,6 +453,9 @@ dnode_rsp_send_next(struct context *ctx, struct conn *conn)
 
         //need to deal with multi-block later
         uint64_t msg_id = pmsg->dmsg->id;
+        if (rsp->dnode_header_prepended) {
+            return rsp;
+        }
 
         struct mbuf *header_buf = mbuf_get();
         if (header_buf == NULL) {
@@ -424,6 +497,7 @@ dnode_rsp_send_next(struct context *ctx, struct conn *conn)
             dmsg_write(header_buf, msg_id, msg_type, conn, msg_length(rsp));
         }
 
+        rsp->dnode_header_prepended = 1;
         mbuf_insert_head(&rsp->mhdr, header_buf);
 
         if (log_loggable(LOG_VVERB)) {

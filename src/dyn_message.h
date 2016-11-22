@@ -26,6 +26,7 @@
 #include "dyn_core.h"
 #include "dyn_dnode_msg.h"
 #include "dyn_response_mgr.h"
+#include "dyn_types.h"
 
 #define ALLOC_MSGS					  200000
 #define MIN_ALLOC_MSGS		     	  100000
@@ -37,9 +38,13 @@ typedef void (*func_msg_parse_t)(struct msg *);
 typedef rstatus_t (*func_msg_post_splitcopy_t)(struct msg *);
 typedef void (*func_msg_coalesce_t)(struct msg *r);
 typedef rstatus_t (*msg_response_handler_t)(struct msg *req, struct msg *rsp);
-typedef uint64_t msgid_t;
 typedef rstatus_t (*func_msg_reply_t)(struct msg *r);
 typedef bool (*func_msg_failure_t)(struct msg *r);
+void set_datastore_ops(void);
+extern func_mbuf_copy_t     g_pre_splitcopy;   /* message pre-split copy */
+extern func_msg_post_splitcopy_t g_post_splitcopy;  /* message post-split copy */
+extern func_msg_coalesce_t  g_pre_coalesce;    /* message pre-coalesce */
+extern func_msg_coalesce_t  g_post_coalesce;   /* message post-coalesce */
 
 
 typedef enum msg_parse_result {
@@ -177,12 +182,15 @@ typedef enum msg_type {
     MSG_REQ_REDIS_ZSCORE,
     MSG_REQ_REDIS_ZUNIONSTORE,
     MSG_REQ_REDIS_ZSCAN,
-    MSG_REQ_REDIS_EVAL,                   /* redis requests - eval */
+    MSG_REQ_REDIS_EVAL,                   /* redis requests - Lua */
     MSG_REQ_REDIS_EVALSHA,
+	MSG_REQ_REDIS_PFADD,                  /* redis requests - hyperloglog */
+	MSG_REQ_REDIS_PFCOUNT,
     MSG_RSP_REDIS_STATUS,                 /* redis response */
     MSG_RSP_REDIS_INTEGER,
     MSG_RSP_REDIS_BULK,
     MSG_RSP_REDIS_MULTIBULK,
+	MSG_REQ_REDIS_CONFIG,
     MSG_RSP_REDIS_ERROR,
     MSG_RSP_REDIS_ERROR_ERR,
     MSG_RSP_REDIS_ERROR_OOM,
@@ -204,16 +212,53 @@ typedef enum msg_type {
 typedef enum dyn_error {
     UNKNOWN_ERROR,
     PEER_CONNECTION_REFUSE,
+    PEER_HOST_DOWN,
+    PEER_HOST_NOT_CONNECTED,
     STORAGE_CONNECTION_REFUSE,
-    BAD_FORMAT
+    BAD_FORMAT,
+    NO_QUORUM_ACHIEVED,
 } dyn_error_t;
 
+static inline char *
+dn_strerror(dyn_error_t err)
+{
+    switch(err)
+    {
+        case NO_QUORUM_ACHIEVED:
+            return "Failed to achieve Quorum";
+        case PEER_HOST_DOWN:
+            return "Peer Node is down";
+        case PEER_HOST_NOT_CONNECTED:
+            return "Peer Node is not connected";
+        default:
+            return strerror(err);
+    }
+}
+
+static inline char *
+dyn_error_source(dyn_error_t err)
+{
+    switch(err)
+    {
+        case NO_QUORUM_ACHIEVED:
+            return "Dynomite:";
+        case PEER_CONNECTION_REFUSE:
+        case PEER_HOST_DOWN:
+        case PEER_HOST_NOT_CONNECTED:
+            return "Peer:";
+        case STORAGE_CONNECTION_REFUSE:
+            return "Storage:";
+        default:
+            return "unknown:";
+    }
+}
 /* This is a wrong place for this typedef. But adding to core has some
  * dependency issues - FixIt someother day :(
  */
 typedef enum consistency {
     DC_ONE = 0,
-    DC_QUORUM = 1
+    DC_QUORUM,
+    DC_SAFE_QUORUM,
 } consistency_t;
 
 static inline char*
@@ -223,6 +268,7 @@ get_consistency_string(consistency_t cons)
     {
         case DC_ONE: return "DC_ONE";
         case DC_QUORUM: return "DC_QUORUM";
+        case DC_SAFE_QUORUM: return "DC_SAFE_QUORUM";
     }
     return "INVALID CONSISTENCY";
 }
@@ -231,7 +277,7 @@ get_consistency_string(consistency_t cons)
 #define DEFAULT_WRITE_CONSISTENCY DC_ONE
 extern consistency_t g_write_consistency;
 extern consistency_t g_read_consistency;
-extern int8_t g_timeout_factor;
+extern uint8_t g_timeout_factor;
 
 struct msg {
     TAILQ_ENTRY(msg)     c_tqe;           /* link in client q */
@@ -241,8 +287,9 @@ struct msg {
     msgid_t              id;              /* message id */
     struct msg           *peer;           /* message peer */
     struct conn          *owner;          /* message owner - client | server */
-    int64_t              stime_in_microsec;  /* start time in microsec */
-    int64_t              remote_region_send_time; /* time in microsec when message sent to remote region */
+    usec_t               stime_in_microsec;  /* start time in microsec */
+    int64_t              request_inqueue_enqueue_time_us; /* when message was enqueued in inqueue, either to the data store or remote region or cross rack */
+    int64_t              request_send_time; /* when message was sent: either to the data store or remote region or cross rack */
     uint8_t              awaiting_rsps;
     struct msg           *selected_rsp;
 
@@ -258,10 +305,6 @@ struct msg {
     func_msg_parse_t     parser;          /* message parser */
     msg_parse_result_t   result;          /* message parsing result */
 
-    func_mbuf_copy_t     pre_splitcopy;   /* message pre-split copy */
-    func_msg_post_splitcopy_t post_splitcopy;  /* message post-split copy */
-    func_msg_coalesce_t  pre_coalesce;    /* message pre-coalesce */
-    func_msg_coalesce_t  post_coalesce;   /* message post-coalesce */
 
     msg_type_t           type;            /* message type */
 
@@ -287,15 +330,20 @@ struct msg {
     unsigned             ferror:1;        /* one or more fragments are in error? */
     unsigned             request:1;       /* request? or response? */
     unsigned             quit:1;          /* quit request? */
-    unsigned             noreply:1;       /* noreply? */
+    unsigned             expect_datastore_reply:1;       /* expect datastore reply */
     unsigned             done:1;          /* done? */
     unsigned             fdone:1;         /* all fragments are done? */
     unsigned             first_fragment:1;/* first fragment? */
     unsigned             last_fragment:1; /* last fragment? */
     unsigned             swallow:1;       /* swallow response? */
+    /* We need a way in dnode_rsp_send_next to remember if we already
+     * did a dmsg_write of a dnode header in this message. If we do not remember it,
+     * then if the same message gets attempted to be sent twice in msg_send_chain,
+     * (due to lack of space in the previous attempt), we will prepend another header
+     * and we will have corrupted message at the destination */
+    unsigned             dnode_header_prepended:1;
     unsigned             rsp_sent:1;      /* is a response sent for this request?*/
 
-    int					 data_store;
     //dynomite
     struct dmsg          *dmsg;          /* dyn message */
     int                  dyn_state;
@@ -345,7 +393,7 @@ void msg_tmo_delete(struct msg *msg);
 void msg_init(struct instance *nci);
 rstatus_t msg_clone(struct msg *src, struct mbuf *mbuf_start, struct msg *target);
 void msg_deinit(void);
-struct msg *msg_get(struct conn *conn, bool request, int data_store, const char* const caller);
+struct msg *msg_get(struct conn *conn, bool request, const char* const caller);
 void msg_put(struct msg *msg);
 uint32_t msg_mbuf_size(struct msg *msg);
 uint32_t msg_length(struct msg *msg);
@@ -390,6 +438,6 @@ void local_req_forward(struct context *ctx, struct conn *c_conn, struct msg *msg
 void dnode_peer_req_forward(struct context *ctx, struct conn *c_conn, struct conn *p_conn,
 		                struct msg *msg, struct rack *rack, uint8_t *key, uint32_t keylen);
 
-//void peer_gossip_forward(struct context *ctx, struct conn *conn, int data_store, struct string *data);
-void dnode_peer_gossip_forward(struct context *ctx, struct conn *conn, int data_store, struct mbuf *data);
+//void peer_gossip_forward(struct context *ctx, struct conn *conn, struct string *data);
+void dnode_peer_gossip_forward(struct context *ctx, struct conn *conn, struct mbuf *data);
 #endif

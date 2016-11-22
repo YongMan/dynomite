@@ -32,7 +32,7 @@ req_get(struct conn *conn)
     ASSERT((conn->type == CONN_CLIENT) ||
            (conn->type == CONN_DNODE_PEER_CLIENT));
 
-    msg = msg_get(conn, true, conn->data_store, __FUNCTION__);
+    msg = msg_get(conn, true, __FUNCTION__);
     if (msg == NULL) {
         conn->err = errno;
     }
@@ -86,11 +86,13 @@ req_done(struct conn *conn, struct msg *msg)
     ASSERT((conn->type == CONN_CLIENT) ||
            (conn->type == CONN_DNODE_PEER_CLIENT));
 
-    if (msg == NULL || (!msg->done && !msg->selected_rsp)) {
+    if (msg == NULL)
         return false;
-    }
 
     ASSERT(msg->request);
+
+    if (!msg->selected_rsp)
+        return false;
 
     id = msg->frag_id;
     if (id == 0) {
@@ -108,18 +110,16 @@ req_done(struct conn *conn, struct msg *msg)
          cmsg != NULL && cmsg->frag_id == id;
          pmsg = cmsg, cmsg = TAILQ_PREV(cmsg, msg_tqh, c_tqe)) {
 
-        if (!cmsg->done) {
+        if (!cmsg->selected_rsp)
             return false;
-        }
     }
 
     for (pmsg = msg, cmsg = TAILQ_NEXT(msg, c_tqe);
          cmsg != NULL && cmsg->frag_id == id;
          pmsg = cmsg, cmsg = TAILQ_NEXT(cmsg, c_tqe)) {
 
-        if (!cmsg->done) {
+        if (!cmsg->selected_rsp)
             return false;
-        }
     }
 
     if (!pmsg->last_fragment) {
@@ -153,7 +153,7 @@ req_done(struct conn *conn, struct msg *msg)
 
     ASSERT(msg->frag_owner->nfrag == nfragment);
 
-    msg->post_coalesce(msg->frag_owner);
+    g_post_coalesce(msg->frag_owner);
 
     log_debug(LOG_DEBUG, "req from c %d with fid %"PRIu64" and %"PRIu32" "
               "fragments is done", conn->sd, id, nfragment);

@@ -26,8 +26,9 @@
 #include "../dyn_core.h"
 #include "dyn_proto.h"
 
-#define RSP_STRING(ACTION)                                                          \
-    ACTION( pong,             "+PONG\r\n"                                         ) \
+#define RSP_STRING(ACTION)                                   \
+    ACTION( ok,               "+OK\r\n"                     ) \
+    ACTION( pong,             "+PONG\r\n"                   ) \
 
 #define DEFINE_ACTION(_var, _str) static struct string rsp_##_var = string(_str);
     RSP_STRING( DEFINE_ACTION )
@@ -89,6 +90,7 @@ redis_arg0(struct msg *r)
     case MSG_REQ_REDIS_ZCARD:
 
     case MSG_REQ_REDIS_KEYS:
+    case MSG_REQ_REDIS_PFCOUNT:
         return true;
 
     default:
@@ -133,6 +135,8 @@ redis_arg1(struct msg *r)
     case MSG_REQ_REDIS_ZREVRANK:
     case MSG_REQ_REDIS_ZSCORE:
     case MSG_REQ_REDIS_SLAVEOF:
+    case MSG_REQ_REDIS_CONFIG:
+
         return true;
 
     default:
@@ -174,6 +178,7 @@ redis_arg2(struct msg *r)
     case MSG_REQ_REDIS_ZREMRANGEBYSCORE:
 
     case MSG_REQ_REDIS_RESTORE:
+
         return true;
 
     default:
@@ -242,6 +247,7 @@ redis_argn(struct msg *r)
     case MSG_REQ_REDIS_ZREVRANGEBYSCORE:
     case MSG_REQ_REDIS_ZUNIONSTORE:
     case MSG_REQ_REDIS_ZSCAN:
+    case MSG_REQ_REDIS_PFADD:
         return true;
 
     default:
@@ -624,7 +630,7 @@ redis_parse_req(struct msg *r)
                     break;
                 }
 
-                if (str4icmp(m, 'i', 'n', 'f', 'o')) { /* Yannis: Need to identify how this is defined in Redis protocol */
+                if (str4icmp(m, 'i', 'n', 'f', 'o')) {
                     r->type = MSG_REQ_REDIS_INFO;
                     r->msg_type = 1; //local only
                     p = p + 1;
@@ -725,7 +731,7 @@ redis_parse_req(struct msg *r)
 
                 if (str4icmp(m, 'e', 'v', 'a', 'l')) {
                     r->type = MSG_REQ_REDIS_EVAL;
-                    r->is_read = 1;
+                    r->is_read = 0;
                     break;
                 }
 
@@ -844,7 +850,12 @@ redis_parse_req(struct msg *r)
                      r->type = MSG_REQ_REDIS_ZSCAN;
                      r->is_read = 1;
                      break;
-                 }
+                }
+                if (str5icmp(m, 'p', 'f', 'a', 'd', 'd')) {
+                     r->type = MSG_REQ_REDIS_PFADD;
+                     r->is_read = 0;
+                     break;
+                }
 
                 break;
 
@@ -969,6 +980,13 @@ redis_parse_req(struct msg *r)
                     break;
                 }
 
+                if (str6icmp(m, 'c', 'o', 'n', 'f', 'i', 'g')) {
+                	r->type = MSG_REQ_REDIS_CONFIG;
+                    r->msg_type = 1; //local only
+                	r->is_read = 1;
+                	break;
+                }
+
                 break;
 
             case 7:
@@ -1016,7 +1034,7 @@ redis_parse_req(struct msg *r)
 
                 if (str7icmp(m, 'e', 'v', 'a', 'l', 's', 'h', 'a')) {
                     r->type = MSG_REQ_REDIS_EVALSHA;
-                    r->is_read = 1;
+                    r->is_read = 0;
                     break;
                 }
 
@@ -1030,6 +1048,11 @@ redis_parse_req(struct msg *r)
                     r->type = MSG_REQ_REDIS_SLAVEOF;
                     r->msg_type = 1;
                     r->is_read = 0;
+                    break;
+                }
+                if (str7icmp(m, 'p', 'f', 'c', 'o', 'u', 'n', 't')) {
+                    r->type = MSG_REQ_REDIS_PFCOUNT;
+                    r->is_read = 1;
                     break;
                 }
 
@@ -1107,6 +1130,8 @@ redis_parse_req(struct msg *r)
                     r->is_read = 0;
                     break;
                 }
+
+                break;
 
             case 11:
                 if (str11icmp(m, 'i', 'n', 'c', 'r', 'b', 'y', 'f', 'l', 'o', 'a', 't')) {
@@ -1331,7 +1356,7 @@ redis_parse_req(struct msg *r)
                      if (r->rnarg == 0) {
                          goto done;
                      }
-                     state = SW_KEY_LEN;
+                     state = SW_FRAGMENT;
                  } else if (redis_argkvx(r)) {
                      if (r->narg % 2 == 0) {
                          goto error;
@@ -1393,7 +1418,14 @@ redis_parse_req(struct msg *r)
             break;
 
         case SW_ARG1:
+
+
+            if (r->type == MSG_REQ_REDIS_CONFIG && !str3icmp(m, 'g', 'e', 't')) {
+                log_error("Redis CONFIG command not supported '%.*s'", p - m, m);
+                goto error;
+            }
             m = p + r->rlen;
+
             if (m >= b->last) {
                 r->rlen -= (uint32_t)(b->last - p);
                 m = b->last - 1;
@@ -1407,6 +1439,7 @@ redis_parse_req(struct msg *r)
 
             p = m; /* move forward by rlen bytes */
             r->rlen = 0;
+
 
             state = SW_ARG1_LF;
 
@@ -1435,8 +1468,14 @@ redis_parse_req(struct msg *r)
                         goto done;
                     }
                     state = SW_ARGN_LEN;
+                 } else if (redis_argkvx(r)) {
+                     if (r->rnarg == 0) {
+                         goto done;
+                     }
+                     state = SW_FRAGMENT;
                 } else if (redis_argeval(r)) {
                     if (r->rnarg < 2) {
+                    	log_error("Dynomite EVAL/EVALSHA requires at least 1 key");
                         goto error;
                     }
                     state = SW_ARG2_LEN;
@@ -1513,7 +1552,6 @@ redis_parse_req(struct msg *r)
             if (redis_argeval(r)) {
                 uint32_t nkey;
                 uint8_t *chp;
-
                 /*
                  * For EVAL/EVALSHA, we need to find the integer value of this
                  * argument. It tells us the number of keys in the script, and
@@ -2373,6 +2411,11 @@ redis_pre_splitcopy(struct mbuf *mbuf, void *arg)
                         r->narg - 1);
         break;
 
+     case MSG_REQ_REDIS_MSET:
+        n = dn_snprintf(mbuf->last, mbuf_size(mbuf), "*%d\r\n$4\r\nmset\r\n",
+                        r->narg - 2);
+        break;
+
     case MSG_REQ_REDIS_DEL:
         n = dn_snprintf(mbuf->last, mbuf_size(mbuf), "*%d\r\n$3\r\ndel\r\n",
                         r->narg - 1);
@@ -2395,6 +2438,9 @@ redis_post_splitcopy(struct msg *r)
 {
     struct mbuf *hbuf, *nhbuf;         /* head mbuf and new head mbuf */
     struct string hstr = string("*2"); /* header string */
+    if (r->type == MSG_REQ_REDIS_MSET) {
+        string_set_text(&hstr, "*3");
+    }
 
     ASSERT(r->request);
     ASSERT(r->type == MSG_REQ_REDIS_MGET || r->type == MSG_REQ_REDIS_DEL);
@@ -2498,6 +2544,14 @@ redis_pre_coalesce(struct msg *r)
         }
         break;
 
+    case MSG_RSP_REDIS_STATUS:
+        if (pr->type == MSG_REQ_REDIS_MSET) {       /* MSET segments */
+            mbuf = STAILQ_FIRST(&r->mhdr);
+            r->mlen -= mbuf_length(mbuf);
+            mbuf_rewind(mbuf);
+        }
+        break;
+
     default:
         /*
          * Valid responses for a fragmented request are MSG_RSP_REDIS_INTEGER or,
@@ -2522,9 +2576,10 @@ redis_pre_coalesce(struct msg *r)
 void
 redis_post_coalesce(struct msg *r)
 {
-    struct msg *pr = r->peer; /* peer response */
+    struct msg *pr = r->selected_rsp; /* peer response */
     struct mbuf *mbuf;
     int n;
+    rstatus_t status = DN_OK;
 
     ASSERT(r->request && r->first_fragment);
     if (r->error || r->ferror) {
@@ -2561,6 +2616,12 @@ redis_post_coalesce(struct msg *r)
         pr->mlen += (uint32_t)n;
         break;
 
+    case MSG_RSP_REDIS_STATUS:
+        status = msg_append(pr, rsp_ok.data, rsp_ok.len);
+        if (status != DN_OK) {
+            pr->error = 1;        /* mark this msg as err */
+            pr->err = errno;
+        }
     default:
         NOT_REACHED();
     }
